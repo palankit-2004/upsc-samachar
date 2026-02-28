@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-PIB Scraper for UPSC Samachar
-Architecture identical to pibdigest.netlify.app:
-  - Scrapes pib.gov.in listing pages for PRIDs
-  - Fetches each press release page
-  - Writes public/data/pib_index.json  (article listing)
-  - Writes public/data/items/<PRID>.json (full text per article)
+PIB Scraper for UPSC Samachar (Netlify-friendly)
+
+Fix:
+- Instead of scraping pib.gov.in HTML listing pages (often blocked/encoded on Netlify),
+  this version reads PIB's official RSS feed to get PRIDs reliably.
+
+Flow:
+1) Read PIB RSS -> collect PRIDs (MAX_ARTICLES)
+2) Fetch each PRID detail page -> parse title/date/ministry/body
+3) Write:
+   - public/data/pib_index.json
+   - public/data/items/<PRID>.json
 
 Run: python scrape_pib.py
 Netlify runs this automatically via build command in netlify.toml
@@ -20,13 +26,15 @@ import sys
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import xml.etree.ElementTree as ET
+
 
 # ── CONFIG ────────────────────────────────────────────────────────
 OUT_DIR       = os.path.join(os.path.dirname(__file__), "public", "data")
 ITEMS_DIR     = os.path.join(OUT_DIR, "items")
 MAX_ARTICLES  = 60          # how many PIB releases to fetch
 MAX_WORKERS   = 6           # parallel fetches
-TIMEOUT       = 15          # seconds per request
+TIMEOUT       = 20          # seconds per request
 DELAY_BETWEEN = 0.3         # seconds between batches (be polite)
 
 HEADERS = {
@@ -35,8 +43,10 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
+    # RSS sometimes returns as XML; keep Accept broad
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+    # IMPORTANT: do NOT ask for br (brotli) unless brotli installed
     "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
@@ -113,88 +123,65 @@ def fetch(url, referer=None):
     return None
 
 
-def scrape_listing_page(url):
-    """Scrape a PIB listing page and return list of (prid, inline_title, inline_ministry, inline_date)."""
-    print(f"Scraping listing: {url}", flush=True)
-    html = fetch(url, referer="https://www.pib.gov.in/")
-    if not html:
+# ── NEW: RSS listing (replaces HTML listing) ──────────────────────
+def scrape_listing_page(rss_url):
+    """
+    Read PIB RSS and return list of entries:
+      { prid, inline_title, inline_ministry, inline_date }
+    inline_ministry/date may be empty — detail page parsing will fill them.
+    """
+    print(f"Scraping RSS: {rss_url}", flush=True)
+    xml_text = fetch(rss_url, referer="https://www.pib.gov.in/")
+    if not xml_text:
         return []
 
-    soup = BeautifulSoup(html, "lxml")
     results = []
     seen = set()
 
-    # PIB listing rows — find all links with PRID in href
-    for a_tag in soup.find_all("a", href=re.compile(r"PRID=\d{6,8}", re.I)):
-        m = re.search(r"PRID=(\d{6,8})", a_tag["href"], re.I)
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        print(f"  RSS parse error: {e}", flush=True)
+        return []
+
+    # Standard RSS: channel/item
+    for item in root.findall(".//item"):
+        link = (item.findtext("link") or "").strip()
+        title = (item.findtext("title") or "").strip()
+
+        m = re.search(r"PRID=(\d{6,8})", link, re.I)
         if not m:
             continue
+
         prid = m.group(1)
         if prid in seen:
             continue
         seen.add(prid)
 
-        # Extract inline title from anchor text
-        title = a_tag.get_text(" ", strip=True)
         title = re.sub(r"\s+", " ", title).strip()
-        if len(title) < 10:
-            # Try title attribute
-            title = a_tag.get("title", "").strip() or title
 
-        # Skip Hindi (Devanagari) titles
+        # Skip Hindi-heavy titles
         if re.search(r"[\u0900-\u097F]{5,}", title):
             continue
-
-        # Find ministry by looking at surrounding HTML
-        ministry = ""
-        parent = a_tag.parent
-        for _ in range(5):  # walk up DOM
-            if parent is None:
-                break
-            parent_text = parent.get_text(" ", strip=True)
-            for min_name in MINISTRY_ORDER:
-                if min_name in parent_text:
-                    ministry = min_name
-                    break
-            if ministry:
-                break
-            parent = parent.parent
-
-        # Find date near this anchor
-        date_str = ""
-        container_text = ""
-        p = a_tag.parent
-        for _ in range(4):
-            if p is None:
-                break
-            container_text += " " + p.get_text(" ", strip=True)
-            p = p.parent
-        dm = re.search(
-            r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})",
-            container_text, re.I
-        )
-        if dm:
-            date_str = dm.group(1)
-        else:
-            dm2 = re.search(r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})", container_text)
-            if dm2:
-                date_str = dm2.group(1)
 
         results.append({
             "prid": prid,
             "inline_title": title,
-            "inline_ministry": ministry,
-            "inline_date": date_str,
+            "inline_ministry": "",
+            "inline_date": "",
         })
 
-    print(f"  Found {len(results)} PRIDs", flush=True)
+        if len(results) >= MAX_ARTICLES:
+            break
+
+    print(f"  Found {len(results)} PRIDs via RSS", flush=True)
     return results
 
 
 def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date=""):
     """Fetch and parse a single PIB press release page."""
     url = f"https://pib.gov.in/PressReleasePage.aspx?PRID={prid}"
-    html = fetch(url, referer="https://www.pib.gov.in/allRel.aspx")
+    html = fetch(url, referer="https://www.pib.gov.in/")
 
     if not html:
         # Fallback to inline data
@@ -206,7 +193,6 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
 
     # ── Title ──────────────────────────────────────────────────
     title = ""
-    # Try specific PIB containers first
     for selector in [
         "div.innner-page-main-about-us-head-right h2",
         "div.innner-page-main-about-us-head-right h3",
@@ -225,12 +211,13 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
                 break
 
     if not title:
-        # Meta fallback
         og = soup.find("meta", {"property": "og:title"}) or soup.find("meta", {"name": "title"})
         if og and og.get("content"):
             title = og["content"].strip()
+
     if not title and inline_title:
         title = inline_title
+
     if not title or len(title) < 8:
         return None, None
 
@@ -250,7 +237,6 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
     # ── Date ───────────────────────────────────────────────────
     date_str = inline_date
     if not date_str:
-        # "Posted On: 01 March 2025" pattern
         for pat in [
             r"Posted\s+On[:\s]*(\d{1,2}\s+\w+\s+\d{4})",
             r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})",
@@ -260,7 +246,6 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
                 date_str = dm.group(1)
                 break
 
-    # Parse date
     pub_date = datetime.now(timezone.utc).isoformat()
     if date_str:
         for fmt in ["%d %B %Y", "%d %b %Y", "%d/%m/%Y", "%d-%m-%Y"]:
@@ -270,7 +255,7 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
             except ValueError:
                 continue
 
-    # ── Body text (snippet + full) ─────────────────────────────
+    # ── Body text ──────────────────────────────────────────────
     body_text = ""
     for selector in [
         "div#ContentDiv",
@@ -281,7 +266,6 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
     ]:
         el = soup.select_one(selector)
         if el:
-            # Remove script/style tags
             for tag in el(["script", "style", "noscript"]):
                 tag.decompose()
             body_text = el.get_text("\n", strip=True)
@@ -344,21 +328,21 @@ def main():
     os.makedirs(ITEMS_DIR, exist_ok=True)
 
     print("=" * 60, flush=True)
-    print("PIB SCRAPER — UPSC Samachar", flush=True)
+    print("PIB SCRAPER — UPSC Samachar (RSS mode)", flush=True)
     print(f"Time: {datetime.now(timezone.utc).isoformat()}", flush=True)
     print("=" * 60, flush=True)
 
-    # ── Step 1: Collect PRIDs from listing pages ───────────────
-    listing_pages = [
-        "https://pib.gov.in/allRel.aspx",
-        "https://pib.gov.in/PMContents/PMContents.aspx?menuid=1&Lang=1&RegionId=3",
+    # ── Step 1: Collect PRIDs from RSS ─────────────────────────
+    # PIB "Press Releases RSS" commonly works well on servers like Netlify
+    rss_pages = [
+        "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",
     ]
 
     all_entries = []
     seen_prids = set()
 
-    for page_url in listing_pages:
-        entries = scrape_listing_page(page_url)
+    for rss_url in rss_pages:
+        entries = scrape_listing_page(rss_url)
         for e in entries:
             if e["prid"] not in seen_prids:
                 seen_prids.add(e["prid"])
@@ -371,8 +355,7 @@ def main():
     print(f"\nTotal unique PRIDs to fetch: {len(all_entries)}", flush=True)
 
     if not all_entries:
-        print("ERROR: No PRIDs found! PIB may be blocking requests.", flush=True)
-        # Write empty but valid JSON so the site doesn't crash
+        print("ERROR: No PRIDs found! RSS may be blocked or empty.", flush=True)
         out = {"updated_at_utc": datetime.now(timezone.utc).isoformat(), "items": []}
         with open(os.path.join(OUT_DIR, "pib_index.json"), "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
@@ -399,7 +382,6 @@ def main():
             done += 1
             if art:
                 articles.append(art)
-                # Write individual PRID JSON (like pibdigest data/items/PRID.json)
                 item_path = os.path.join(ITEMS_DIR, f"{prid}.json")
                 with open(item_path, "w", encoding="utf-8") as f:
                     json.dump({"prid": prid, "text": full_text or ""}, f, ensure_ascii=False)
@@ -407,7 +389,6 @@ def main():
             else:
                 failed += 1
                 print(f"  [{done}/{len(all_entries)}] ✗ {prid}: skipped", flush=True)
-            # Small delay to avoid hammering PIB
             time.sleep(0.1)
 
     # Sort by pub_date descending
