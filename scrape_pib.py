@@ -1,41 +1,40 @@
 #!/usr/bin/env python3
 """
-PIB Scraper for UPSC Samachar (Netlify-friendly)
+PIB Scraper for UPSC Samachar (Netlify-safe)
 
-Fix:
-- Instead of scraping pib.gov.in HTML listing pages (often blocked/encoded on Netlify),
-  this version reads PIB's official RSS feed to get PRIDs reliably.
+Why items were empty:
+- Netlify often fails to fetch/parse PIB HTML listing OR RSS due to encoding/blocking.
+This script uses a robust strategy:
+1) Try multiple PIB RSS feeds (most reliable).
+2) If RSS returns 0, fallback to PIB HTML listing pages.
+3) Fetch each PRID detail page and generate JSON files.
 
-Flow:
-1) Read PIB RSS -> collect PRIDs (MAX_ARTICLES)
-2) Fetch each PRID detail page -> parse title/date/ministry/body
-3) Write:
-   - public/data/pib_index.json
-   - public/data/items/<PRID>.json
-
-Run: python scrape_pib.py
-Netlify runs this automatically via build command in netlify.toml
+Outputs:
+- public/data/pib_index.json
+- public/data/items/<PRID>.json
 """
 
-import requests
-import re
-import json
 import os
-import time
+import re
 import sys
+import json
+import time
+import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import xml.etree.ElementTree as ET
 
 
 # ── CONFIG ────────────────────────────────────────────────────────
-OUT_DIR       = os.path.join(os.path.dirname(__file__), "public", "data")
+BASE_DIR      = os.path.dirname(__file__)
+OUT_DIR       = os.path.join(BASE_DIR, "public", "data")
 ITEMS_DIR     = os.path.join(OUT_DIR, "items")
-MAX_ARTICLES  = 60          # how many PIB releases to fetch
-MAX_WORKERS   = 6           # parallel fetches
-TIMEOUT       = 20          # seconds per request
-DELAY_BETWEEN = 0.3         # seconds between batches (be polite)
+
+MAX_ARTICLES  = 60
+MAX_WORKERS   = 6
+TIMEOUT       = 25
+DELAY_BETWEEN = 0.35
 
 HEADERS = {
     "User-Agent": (
@@ -43,16 +42,17 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    # RSS sometimes returns as XML; keep Accept broad
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-    # IMPORTANT: do NOT ask for br (brotli) unless brotli installed
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "gzip, deflate",  # do NOT include br unless brotli installed
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
-# UPSC-priority ministry list (same as pibdigest)
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+
+# UPSC-priority ministry list
 MINISTRY_ORDER = [
     "Prime Minister's Office",
     "Ministry of Defence",
@@ -100,54 +100,71 @@ MINISTRY_ORDER = [
     "Election Commission of India",
 ]
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+
+TOPIC_KEYWORDS = {
+    "Polity & Governance": ["parliament","constitution","supreme court","high court","election","amendment","bill","act","cabinet","president","governor","lok sabha","rajya sabha","judiciary","panchayat","governance","policy","commission","ordinance","regulation","tribunal"],
+    "Economy": ["gdp","inflation","rbi","sebi","budget","fiscal","monetary","repo rate","economy","trade","export","import","fdi","msme","agriculture","msp","niti aayog","economic","tax","gst","growth","market","rupee","investment","revenue","finance","bank","insurance","credit"],
+    "Environment & Ecology": ["climate","biodiversity","forest","wildlife","pollution","carbon","emission","renewable","solar","ozone","ramsar","tiger","elephant","coral","wetland","deforestation","net zero","cop","ecology","conservation","environment","water","river","drought","flood","green"],
+    "Science & Technology": ["isro","space","satellite","artificial intelligence","quantum","nuclear","research","technology","5g","semiconductor","drone","cyber","digital","blockchain","genomics","innovation","patent","rocket","launch","mission","ai","iit","csir","dst"],
+    "International Relations": ["bilateral","treaty","summit","united nations","world bank","imf","wto","g20","brics","sco","asean","nato","geopolitics","diplomacy","foreign","sanctions","agreement","alliance","visit","memorandum","mou","quad","g7","un security"],
+    "Social Issues": ["poverty","welfare","education","health","nutrition","women","child","tribal","dalit","minority","reservation","disability","elderly","hunger","literacy","inequality","yojana","scheme","programme","social security","pm-kisan"],
+    "Defence & Security": ["defence","military","army","navy","air force","border","security","terrorism","naxal","insurgency","weapon","missile","drdo","iaf","coast guard","exercise","combat","strategic","bsf","crpf"],
+    "Infrastructure & Development": ["railway","highway","port","airport","metro","smart city","urban","housing","construction","energy","power","grid","infrastructure","expressway","corridor","project","bridge","dam","roads","nhsrcl"],
+}
 
 
-def fetch(url, referer=None):
-    """Fetch a URL with retry logic."""
+def detect_topics(text: str):
+    t = (text or "").lower()
+    matched = [topic for topic, kws in TOPIC_KEYWORDS.items() if any(kw in t for kw in kws)]
+    return matched[:3] if matched else ["General"]
+
+
+def fetch(url: str, referer: str | None = None) -> str | None:
+    """Fetch URL with retry."""
     hdrs = {}
     if referer:
         hdrs["Referer"] = referer
+
     for attempt in range(3):
         try:
             r = SESSION.get(url, headers=hdrs, timeout=TIMEOUT)
             if r.status_code == 200:
                 r.encoding = r.apparent_encoding or "utf-8"
                 return r.text
-            print(f"  HTTP {r.status_code} for {url}", flush=True)
+            print(f"HTTP {r.status_code} -> {url}", flush=True)
         except Exception as e:
-            print(f"  Attempt {attempt+1} failed for {url}: {e}", flush=True)
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
+            print(f"Fetch error attempt {attempt+1} -> {url}: {e}", flush=True)
+
+        time.sleep(1.2 * (attempt + 1))
+
     return None
 
 
-# ── NEW: RSS listing (replaces HTML listing) ──────────────────────
-def scrape_listing_page(rss_url):
-    """
-    Read PIB RSS and return list of entries:
-      { prid, inline_title, inline_ministry, inline_date }
-    inline_ministry/date may be empty — detail page parsing will fill them.
-    """
-    print(f"Scraping RSS: {rss_url}", flush=True)
+# ── Listing: RSS ──────────────────────────────────────────────────
+def list_prids_from_rss(rss_url: str):
+    print(f"[RSS] {rss_url}", flush=True)
     xml_text = fetch(rss_url, referer="https://www.pib.gov.in/")
     if not xml_text:
+        return []
+
+    # clean any junk before XML tag
+    xml_text = xml_text.strip()
+    if "<" in xml_text:
+        xml_text = xml_text[xml_text.find("<"):]
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as e:
+        print(f"[RSS] parse error: {e}", flush=True)
         return []
 
     results = []
     seen = set()
 
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception as e:
-        print(f"  RSS parse error: {e}", flush=True)
-        return []
-
-    # Standard RSS: channel/item
     for item in root.findall(".//item"):
         link = (item.findtext("link") or "").strip()
         title = (item.findtext("title") or "").strip()
+        title = re.sub(r"\s+", " ", title).strip()
 
         m = re.search(r"PRID=(\d{6,8})", link, re.I)
         if not m:
@@ -158,9 +175,7 @@ def scrape_listing_page(rss_url):
             continue
         seen.add(prid)
 
-        title = re.sub(r"\s+", " ", title).strip()
-
-        # Skip Hindi-heavy titles
+        # skip Hindi titles
         if re.search(r"[\u0900-\u097F]{5,}", title):
             continue
 
@@ -174,24 +189,77 @@ def scrape_listing_page(rss_url):
         if len(results) >= MAX_ARTICLES:
             break
 
-    print(f"  Found {len(results)} PRIDs via RSS", flush=True)
+    print(f"[RSS] found {len(results)} PRIDs", flush=True)
     return results
 
 
+# ── Listing: HTML fallback ────────────────────────────────────────
+def list_prids_from_html(listing_url: str):
+    print(f"[HTML] {listing_url}", flush=True)
+    html = fetch(listing_url, referer="https://www.pib.gov.in/")
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+    seen = set()
+
+    for a_tag in soup.find_all("a", href=re.compile(r"PRID=\d{6,8}", re.I)):
+        href = a_tag.get("href", "")
+        m = re.search(r"PRID=(\d{6,8})", href, re.I)
+        if not m:
+            continue
+
+        prid = m.group(1)
+        if prid in seen:
+            continue
+        seen.add(prid)
+
+        title = a_tag.get_text(" ", strip=True)
+        title = re.sub(r"\s+", " ", title).strip() or a_tag.get("title", "").strip()
+
+        if re.search(r"[\u0900-\u097F]{5,}", title):
+            continue
+
+        results.append({
+            "prid": prid,
+            "inline_title": title,
+            "inline_ministry": "",
+            "inline_date": "",
+        })
+
+        if len(results) >= MAX_ARTICLES:
+            break
+
+    print(f"[HTML] found {len(results)} PRIDs", flush=True)
+    return results
+
+
+def _make_article(prid, title, ministry, pub_date, snippet, url):
+    return {
+        "prid": prid,
+        "title": title,
+        "ministry": ministry,
+        "snippet": snippet,
+        "source_url": url,
+        "pub_date": pub_date,
+        "posted_on_raw": "",
+        "pdfs": [],
+        "topics": detect_topics((title or "") + " " + (snippet or "")),
+    }
+
+
 def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date=""):
-    """Fetch and parse a single PIB press release page."""
     url = f"https://pib.gov.in/PressReleasePage.aspx?PRID={prid}"
     html = fetch(url, referer="https://www.pib.gov.in/")
-
     if not html:
-        # Fallback to inline data
         if inline_title and len(inline_title) >= 10:
             return _make_article(prid, inline_title, inline_ministry, inline_date, "", url), ""
         return None, None
 
     soup = BeautifulSoup(html, "lxml")
 
-    # ── Title ──────────────────────────────────────────────────
+    # Title
     title = ""
     for selector in [
         "div.innner-page-main-about-us-head-right h2",
@@ -204,9 +272,8 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
     ]:
         el = soup.select_one(selector)
         if el:
-            t = el.get_text(" ", strip=True)
-            t = re.sub(r"\s+", " ", t).strip()
-            if len(t) >= 15 and not re.search(r"[\u0900-\u097F]{5,}", t):
+            t = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+            if len(t) >= 12 and not re.search(r"[\u0900-\u097F]{5,}", t):
                 title = t
                 break
 
@@ -215,17 +282,13 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
         if og and og.get("content"):
             title = og["content"].strip()
 
-    if not title and inline_title:
-        title = inline_title
+    if not title:
+        title = inline_title or ""
 
-    if not title or len(title) < 8:
+    if not title or len(title) < 8 or re.search(r"[\u0900-\u097F]{8,}", title):
         return None, None
 
-    # Skip Hindi releases
-    if re.search(r"[\u0900-\u097F]{8,}", title):
-        return None, None
-
-    # ── Ministry ───────────────────────────────────────────────
+    # Ministry
     ministry = inline_ministry
     if not ministry:
         page_text = soup.get_text(" ")
@@ -234,17 +297,12 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
                 ministry = min_name
                 break
 
-    # ── Date ───────────────────────────────────────────────────
+    # Date
     date_str = inline_date
     if not date_str:
-        for pat in [
-            r"Posted\s+On[:\s]*(\d{1,2}\s+\w+\s+\d{4})",
-            r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})",
-        ]:
-            dm = re.search(pat, soup.get_text(" "), re.I)
-            if dm:
-                date_str = dm.group(1)
-                break
+        dm = re.search(r"Posted\s+On[:\s]*(\d{1,2}\s+\w+\s+\d{4})", soup.get_text(" "), re.I)
+        if dm:
+            date_str = dm.group(1)
 
     pub_date = datetime.now(timezone.utc).isoformat()
     if date_str:
@@ -253,17 +311,11 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
                 pub_date = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc).isoformat()
                 break
             except ValueError:
-                continue
+                pass
 
-    # ── Body text ──────────────────────────────────────────────
+    # Body
     body_text = ""
-    for selector in [
-        "div#ContentDiv",
-        "div.innner-page-main-about-us-head-right",
-        "div.content-area",
-        "div#content",
-        "main",
-    ]:
+    for selector in ["div#ContentDiv", "div.content-area", "main", "div#content"]:
         el = soup.select_one(selector)
         if el:
             for tag in el(["script", "style", "noscript"]):
@@ -275,14 +327,15 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
 
     snippet = " ".join(body_text.split())[:500] if body_text else ""
 
-    # ── PDF links ─────────────────────────────────────────────
+    # PDFs
     pdfs = []
     for a in soup.find_all("a", href=re.compile(r"\.pdf", re.I)):
         href = a.get("href", "")
-        if not href.startswith("http"):
+        if href and not href.startswith("http"):
             href = "https://pib.gov.in" + href
-        label = a.get_text(strip=True) or "PDF"
-        pdfs.append({"url": href, "label": label[:80]})
+        if href:
+            label = a.get_text(strip=True) or "PDF"
+            pdfs.append({"url": href, "label": label[:80]})
 
     article = _make_article(prid, title, ministry, pub_date, snippet, url)
     article["pdfs"] = pdfs
@@ -291,36 +344,10 @@ def parse_detail_page(prid, inline_title="", inline_ministry="", inline_date="")
     return article, body_text
 
 
-def _make_article(prid, title, ministry, pub_date, snippet, url):
-    """Build a normalized article dict."""
-    return {
-        "prid": prid,
-        "title": title,
-        "ministry": ministry,
-        "snippet": snippet,
-        "source_url": url,
-        "pub_date": pub_date,
-        "posted_on_raw": "",
-        "pdfs": [],
-        "topics": detect_topics(title + " " + snippet),
-    }
-
-
-TOPIC_KEYWORDS = {
-    "Polity & Governance": ["parliament","constitution","supreme court","high court","election","amendment","bill","act","cabinet","president","governor","lok sabha","rajya sabha","judiciary","panchayat","governance","policy","commission","ordinance","regulation","tribunal"],
-    "Economy": ["gdp","inflation","rbi","sebi","budget","fiscal","monetary","repo rate","economy","trade","export","import","fdi","msme","agriculture","msp","niti aayog","economic","tax","gst","growth","market","rupee","investment","revenue","finance","bank","insurance","credit"],
-    "Environment & Ecology": ["climate","biodiversity","forest","wildlife","pollution","carbon","emission","renewable","solar","ozone","ramsar","tiger","elephant","coral","wetland","deforestation","net zero","cop","ecology","conservation","environment","water","river","drought","flood","green"],
-    "Science & Technology": ["isro","space","satellite","artificial intelligence","quantum","nuclear","research","technology","5g","semiconductor","drone","cyber","digital","blockchain","genomics","innovation","patent","rocket","launch","mission","ai","iit","csir","dst"],
-    "International Relations": ["bilateral","treaty","summit","united nations","world bank","imf","wto","g20","brics","sco","asean","nato","geopolitics","diplomacy","foreign","sanctions","agreement","alliance","visit","memorandum","mou","quad","g7","un security"],
-    "Social Issues": ["poverty","welfare","education","health","nutrition","women","child","tribal","dalit","minority","reservation","disability","elderly","hunger","literacy","inequality","yojana","scheme","programme","social security","pm-kisan"],
-    "Defence & Security": ["defence","military","army","navy","air force","border","security","terrorism","naxal","insurgency","weapon","missile","drdo","iaf","coast guard","exercise","combat","strategic","bsf","crpf"],
-    "Infrastructure & Development": ["railway","highway","port","airport","metro","smart city","urban","housing","construction","energy","power","grid","infrastructure","expressway","corridor","project","bridge","dam","roads","nhsrcl"],
-}
-
-def detect_topics(text):
-    text_lower = text.lower()
-    matched = [topic for topic, kws in TOPIC_KEYWORDS.items() if any(kw in text_lower for kw in kws)]
-    return matched[:3] if matched else ["General"]
+def write_empty_index():
+    out = {"updated_at_utc": datetime.now(timezone.utc).isoformat(), "items": []}
+    with open(os.path.join(OUT_DIR, "pib_index.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -328,54 +355,78 @@ def main():
     os.makedirs(ITEMS_DIR, exist_ok=True)
 
     print("=" * 60, flush=True)
-    print("PIB SCRAPER — UPSC Samachar (RSS mode)", flush=True)
-    print(f"Time: {datetime.now(timezone.utc).isoformat()}", flush=True)
+    print("PIB SCRAPER — UPSC Samachar", flush=True)
+    print(f"UTC Time: {datetime.now(timezone.utc).isoformat()}", flush=True)
     print("=" * 60, flush=True)
 
-    # ── Step 1: Collect PRIDs from RSS ─────────────────────────
-    # PIB "Press Releases RSS" commonly works well on servers like Netlify
+    # 1) Try RSS feeds (multiple variants)
     rss_pages = [
+        "https://www.pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3",
+        "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3",
+        "https://www.pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",
         "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",
+        "https://archive.pib.gov.in/newsite/rssenglish.aspx",
     ]
 
-    all_entries = []
-    seen_prids = set()
-
-    for rss_url in rss_pages:
-        entries = scrape_listing_page(rss_url)
-        for e in entries:
-            if e["prid"] not in seen_prids:
-                seen_prids.add(e["prid"])
-                all_entries.append(e)
-        if len(all_entries) >= MAX_ARTICLES:
+    entries = []
+    for u in rss_pages:
+        got = list_prids_from_rss(u)
+        for e in got:
+            entries.append(e)
+        if len(entries) >= MAX_ARTICLES:
             break
         time.sleep(DELAY_BETWEEN)
 
-    all_entries = all_entries[:MAX_ARTICLES]
-    print(f"\nTotal unique PRIDs to fetch: {len(all_entries)}", flush=True)
+    # de-dup
+    uniq = []
+    seen = set()
+    for e in entries:
+        if e["prid"] not in seen:
+            seen.add(e["prid"])
+            uniq.append(e)
+        if len(uniq) >= MAX_ARTICLES:
+            break
 
-    if not all_entries:
-        print("ERROR: No PRIDs found! RSS may be blocked or empty.", flush=True)
-        out = {"updated_at_utc": datetime.now(timezone.utc).isoformat(), "items": []}
-        with open(os.path.join(OUT_DIR, "pib_index.json"), "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
+    # 2) Fallback to HTML listing if RSS gave nothing
+    if not uniq:
+        listing_pages = [
+            "https://pib.gov.in/Allrel.aspx?lang=1&reg=3",
+            "https://pib.gov.in/PMContents/PMContents.aspx?menuid=1&Lang=1&RegionId=3",
+        ]
+        for u in listing_pages:
+            got = list_prids_from_html(u)
+            for e in got:
+                if e["prid"] not in seen:
+                    seen.add(e["prid"])
+                    uniq.append(e)
+                if len(uniq) >= MAX_ARTICLES:
+                    break
+            if len(uniq) >= MAX_ARTICLES:
+                break
+            time.sleep(DELAY_BETWEEN)
+
+    print(f"Total unique PRIDs to fetch: {len(uniq)}", flush=True)
+
+    if not uniq:
+        print("ERROR: No PRIDs found via RSS or HTML. PIB is likely blocking Netlify.", flush=True)
+        write_empty_index()
         sys.exit(0)
 
-    # ── Step 2: Fetch each press release page (parallel) ──────
+    # 3) Fetch detail pages in parallel
     articles = []
     failed = 0
 
     def fetch_one(entry):
         art, full_text = parse_detail_page(
             entry["prid"],
-            entry["inline_title"],
-            entry["inline_ministry"],
-            entry["inline_date"],
+            entry.get("inline_title", ""),
+            entry.get("inline_ministry", ""),
+            entry.get("inline_date", ""),
         )
         return entry["prid"], art, full_text
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_one, e): e for e in all_entries}
+        futures = {executor.submit(fetch_one, e): e for e in uniq}
         done = 0
         for future in as_completed(futures):
             prid, art, full_text = future.result()
@@ -385,16 +436,15 @@ def main():
                 item_path = os.path.join(ITEMS_DIR, f"{prid}.json")
                 with open(item_path, "w", encoding="utf-8") as f:
                     json.dump({"prid": prid, "text": full_text or ""}, f, ensure_ascii=False)
-                print(f"  [{done}/{len(all_entries)}] ✓ {prid}: {art['title'][:60]}", flush=True)
+                print(f"[{done}/{len(uniq)}] ✓ {prid}: {art['title'][:70]}", flush=True)
             else:
                 failed += 1
-                print(f"  [{done}/{len(all_entries)}] ✗ {prid}: skipped", flush=True)
-            time.sleep(0.1)
+                print(f"[{done}/{len(uniq)}] ✗ {prid}: skipped", flush=True)
+            time.sleep(0.08)
 
-    # Sort by pub_date descending
+    # Sort newest first
     articles.sort(key=lambda a: a.get("pub_date", ""), reverse=True)
 
-    # ── Step 3: Write pib_index.json ──────────────────────────
     output = {
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "total": len(articles),
@@ -405,9 +455,10 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print("\n" + "=" * 60, flush=True)
-    print(f"✅ Done! {len(articles)} articles written to {out_path}", flush=True)
+    print("=" * 60, flush=True)
+    print(f"✅ Done! Articles written: {len(articles)}", flush=True)
     print(f"✗ Failed/skipped: {failed}", flush=True)
+    print(f"Output: {out_path}", flush=True)
     print("=" * 60, flush=True)
 
 
