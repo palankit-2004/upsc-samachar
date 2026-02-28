@@ -1,0 +1,13 @@
+{
+  "name": "upsc-samachar",
+  "version": "1.0.0",
+  "description": "UPSC News Aggregator for Aspirants",
+  "scripts": {
+    "dev": "netlify dev",
+    "build": "echo 'Static build complete'"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "xml2js": "^0.6.2"
+  }
+}
